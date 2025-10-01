@@ -43,6 +43,9 @@ TOKEN_PATTERN = re.compile(r"\{([^{}]+)\}")
 TELEGRAM_FILE_LIMIT = 49 * 1024 * 1024  # Reserve a little margin below 50MB.
 MAX_PLAIN_FILES = 5  # If more files are produced, bundle them in archives.
 
+FILENAME_SANITIZE_RE = re.compile(r"[^A-Za-z0-9_.-]+")
+
+
 
 @dataclass
 class ParsedFormat:
@@ -55,6 +58,19 @@ class ParsedFormat:
 
 class FormatError(ValueError):
     """Raised when a format string cannot be parsed or validated."""
+
+
+
+@dataclass
+class ProcessResult:
+    """Store information about processed output files."""
+
+    entries: List[Tuple[str, bytes]]
+    skipped_lines: int
+
+    @property
+    def produced_files(self) -> int:
+        return len(self.entries)
 
 
 def extract_tokens(template: str) -> List[str]:
@@ -270,9 +286,14 @@ async def handle_file_or_link(update: Update, context: ContextTypes.DEFAULT_TYPE
 
     try:
         if update.message.document:
-            processed_count = await _handle_document(update, context, source_format, target_format, lines_per_file)
+            result = await _handle_document(
+                update, context, source_format, target_format, lines_per_file
+            )
         elif update.message.text and is_valid_url(update.message.text.strip()):
-            processed_count = await _handle_url(update, context, source_format, target_format, lines_per_file)
+            result = await _handle_url(
+                update, context, source_format, target_format, lines_per_file
+            )
+
         else:
             await update.message.reply_text(
                 "Отправьте файл в формате .txt или прямую ссылку на загрузку."
@@ -283,9 +304,17 @@ async def handle_file_or_link(update: Update, context: ContextTypes.DEFAULT_TYPE
         await update.message.reply_text(f"Произошла ошибка: {exc}")
         return ConversationHandler.END
 
-    await update.message.reply_text(
-        f"Готово! Обработано файлов: {processed_count}. Для новой обработки отправьте /start."
-    )
+
+    produced_files = await _finalize_processing(update, context, result)
+
+    if produced_files:
+        await update.message.reply_text(
+            f"Готово! Обработано файлов: {produced_files}. Для новой обработки отправьте /start."
+        )
+    else:
+        await update.message.reply_text("Для новой обработки отправьте /start.")
+
+
     context.user_data.clear()
     return ConversationHandler.END
 
@@ -296,7 +325,8 @@ async def _handle_document(
     source_format: ParsedFormat,
     target_format: str,
     lines_per_file: int,
-) -> int:
+) -> ProcessResult:
+
     document = update.message.document
     if document.file_size and document.file_size > TELEGRAM_FILE_LIMIT:
         raise ValueError("Входной файл превышает ограничение Telegram (≈49 МБ).")
@@ -304,9 +334,13 @@ async def _handle_document(
     await update.message.reply_chat_action(ChatAction.UPLOAD_DOCUMENT)
     telegram_file = await document.get_file()
     with tempfile.TemporaryDirectory() as tmp_dir:
-        local_path = Path(tmp_dir) / document.file_name
+        filename = document.file_name or "input.txt"
+        local_path = Path(tmp_dir) / filename
         await telegram_file.download_to_drive(custom_path=str(local_path))
-        return await _process_local_file(update, context, local_path, source_format, target_format, lines_per_file)
+        return _process_local_file(
+            local_path, source_format, target_format, lines_per_file
+        )
+
 
 
 async def _handle_url(
@@ -315,7 +349,8 @@ async def _handle_url(
     source_format: ParsedFormat,
     target_format: str,
     lines_per_file: int,
-) -> int:
+) -> ProcessResult:
+  
     url = update.message.text.strip()
     await update.message.reply_chat_action(ChatAction.TYPING)
     response = requests.get(url, timeout=30)
@@ -324,41 +359,133 @@ async def _handle_url(
         tmp_file.write(response.content)
         tmp_path = Path(tmp_file.name)
     try:
-        return await _process_local_file(update, context, tmp_path, source_format, target_format, lines_per_file)
+
+        return _process_local_file(tmp_path, source_format, target_format, lines_per_file)
+
     finally:
         tmp_path.unlink(missing_ok=True)
 
 
-async def _process_local_file(
-    update: Update,
-    context: ContextTypes.DEFAULT_TYPE,
+
+def _process_local_file(
     file_path: Path,
     source_format: ParsedFormat,
     target_format: str,
     lines_per_file: int,
-) -> int:
+) -> ProcessResult:
+    if zipfile.is_zipfile(file_path):
+        return _process_zip_archive(file_path, source_format, target_format, lines_per_file)
+
     with file_path.open("r", encoding="utf-8", errors="ignore") as handle:
-        transformed, skipped = transform_lines(handle, source_format, target_format)
+        return _process_stream(
+            handle,
+            file_path.name,
+            source_format,
+            target_format,
+            lines_per_file,
+            {},
+        )
+
+
+def _process_zip_archive(
+    archive_path: Path,
+    source_format: ParsedFormat,
+    target_format: str,
+    lines_per_file: int,
+) -> ProcessResult:
+    entries: List[Tuple[str, bytes]] = []
+    skipped_total = 0
+    name_usage: Dict[str, int] = {}
+    has_files = False
+
+    with zipfile.ZipFile(archive_path) as archive:
+        for info in archive.infolist():
+            if info.is_dir():
+                continue
+            has_files = True
+            with archive.open(info) as raw_stream:
+                with io.TextIOWrapper(raw_stream, encoding="utf-8", errors="ignore") as text_stream:
+                    result = _process_stream(
+                        text_stream,
+                        info.filename,
+                        source_format,
+                        target_format,
+                        lines_per_file,
+                        name_usage,
+                    )
+                entries.extend(result.entries)
+                skipped_total += result.skipped_lines
+
+    if not has_files:
+        raise ValueError("Архив не содержит файлов для обработки.")
+
+    return ProcessResult(entries=entries, skipped_lines=skipped_total)
+
+
+def _process_stream(
+    stream: Iterable[str],
+    source_name: str,
+    source_format: ParsedFormat,
+    target_format: str,
+    lines_per_file: int,
+    name_usage: Dict[str, int],
+) -> ProcessResult:
+    transformed, skipped = transform_lines(stream, source_format, target_format)
 
     if not transformed:
+        return ProcessResult(entries=[], skipped_lines=len(skipped))
+
+    chunks = list(chunk_sequence(transformed, lines_per_file))
+    base_name = _allocate_base_name(source_name, name_usage)
+    multi_part = len(chunks) > 1
+    entries: List[Tuple[str, bytes]] = []
+    for index, chunk in enumerate(chunks, start=1):
+        suffix = f"_part_{index:03d}" if multi_part else ""
+        filename = f"{base_name}{suffix}.txt"
+        entries.append(build_text_file(filename, chunk))
+
+    return ProcessResult(entries=entries, skipped_lines=len(skipped))
+
+
+def _allocate_base_name(raw_name: str, name_usage: Dict[str, int]) -> str:
+    base = _sanitize_basename(raw_name)
+    count = name_usage.get(base, 0)
+    name_usage[base] = count + 1
+    if count == 0:
+        return base
+    return f"{base}_{count + 1:02d}"
+
+
+def _sanitize_basename(raw_name: str) -> str:
+    stem = Path(raw_name).stem or "processed"
+    sanitized = FILENAME_SANITIZE_RE.sub("_", stem).strip("._")
+    return sanitized or "processed"
+
+
+async def _finalize_processing(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE,
+    result: ProcessResult,
+) -> int:
+    if not result.entries:
         await update.message.reply_text(
             "Не удалось преобразовать ни одной строки. Проверьте форматы и попробуйте снова."
         )
+        if result.skipped_lines:
+            await update.message.reply_text(
+                f"Пропущено строк: {result.skipped_lines}. Они не совпали с исходным форматом."
+            )
         return 0
 
-    chunks = list(chunk_sequence(transformed, lines_per_file))
-    entries: List[Tuple[str, bytes]] = []
-    for index, chunk in enumerate(chunks, start=1):
-        filename = f"processed_{index:03d}.txt"
-        entries.append(build_text_file(filename, chunk))
+    await _deliver_results(update, context, result.entries)
 
-    await _deliver_results(update, context, entries)
-
-    if skipped:
+    if result.skipped_lines:
         await update.message.reply_text(
-            f"Пропущено строк: {len(skipped)}. Они не совпали с исходным форматом."
+            f"Пропущено строк: {result.skipped_lines}. Они не совпали с исходным форматом."
         )
-    return len(entries)
+
+    return result.produced_files
+
 
 
 async def _deliver_results(
