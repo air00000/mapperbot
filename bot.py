@@ -27,7 +27,7 @@ import zipfile
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Dict, Iterable, List, Sequence, Tuple
-from urllib.parse import urlparse
+from urllib.parse import parse_qs, urlparse
 
 import requests
 from telegram import InputFile, Update
@@ -350,13 +350,23 @@ async def _handle_url(
     target_format: str,
     lines_per_file: int,
 ) -> ProcessResult:
-  
+
     url = update.message.text.strip()
     await update.message.reply_chat_action(ChatAction.TYPING)
-    response = requests.get(url, timeout=30)
-    response.raise_for_status()
-    with tempfile.NamedTemporaryFile(delete=False) as tmp_file:
-        tmp_file.write(response.content)
+    content: bytes
+    filename: str | None = None
+
+    if _is_google_drive_url(url):
+        content, filename = _download_google_drive_file(url)
+    else:
+        response = requests.get(url, timeout=30)
+        response.raise_for_status()
+        content = response.content
+        filename = _extract_response_filename(response)
+
+    suffix = Path(filename).suffix if filename else ""
+    with tempfile.NamedTemporaryFile(delete=False, suffix=suffix) as tmp_file:
+        tmp_file.write(content)
         tmp_path = Path(tmp_file.name)
     try:
 
@@ -364,6 +374,67 @@ async def _handle_url(
 
     finally:
         tmp_path.unlink(missing_ok=True)
+
+
+def _is_google_drive_url(url: str) -> bool:
+    parsed = urlparse(url)
+    host = parsed.netloc.lower()
+    return host.endswith("drive.google.com") or host.endswith("docs.google.com")
+
+
+def _download_google_drive_file(url: str) -> Tuple[bytes, str | None]:
+    file_id = _extract_google_drive_file_id(url)
+    if not file_id:
+        raise ValueError("Не удалось определить идентификатор файла Google Drive.")
+
+    session = requests.Session()
+    download_url = "https://drive.google.com/uc?export=download"
+    params = {"id": file_id}
+
+    response = session.get(download_url, params=params, timeout=30)
+    response.raise_for_status()
+    token = _get_drive_confirm_token(response)
+    if token:
+        params["confirm"] = token
+        response = session.get(download_url, params=params, timeout=30)
+        response.raise_for_status()
+
+    return response.content, _extract_response_filename(response)
+
+
+def _extract_google_drive_file_id(url: str) -> str | None:
+    parsed = urlparse(url)
+    path_parts = [part for part in parsed.path.split("/") if part]
+    if "d" in path_parts:
+        index = path_parts.index("d")
+        if index + 1 < len(path_parts):
+            return path_parts[index + 1]
+
+    query = parse_qs(parsed.query)
+    for key in ("id", "file_id"):
+        if key in query and query[key]:
+            return query[key][0]
+    return None
+
+
+def _get_drive_confirm_token(response: requests.Response) -> str | None:
+    for key, value in response.cookies.items():
+        if key.startswith("download_warning"):
+            return value
+    return None
+
+
+def _extract_response_filename(response: requests.Response) -> str | None:
+    disposition = response.headers.get("content-disposition")
+    if not disposition:
+        return None
+    filename_match = re.findall(r"filename\*=UTF-8''([^;]+)", disposition)
+    if filename_match:
+        return requests.utils.unquote(filename_match[0])
+    filename_match = re.findall(r'filename="?([^";]+)"?', disposition)
+    if filename_match:
+        return filename_match[0]
+    return None
 
 
 
