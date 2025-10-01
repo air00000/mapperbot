@@ -42,7 +42,9 @@ SOURCE_FORMAT, TARGET_FORMAT, LINES_PER_FILE, AWAITING_FILE = range(4)
 TOKEN_PATTERN = re.compile(r"\{([^{}]+)\}")
 TELEGRAM_FILE_LIMIT = 49 * 1024 * 1024  # Reserve a little margin below 50MB.
 MAX_PLAIN_FILES = 5  # If more files are produced, bundle them in archives.
+
 FILENAME_SANITIZE_RE = re.compile(r"[^A-Za-z0-9_.-]+")
+
 
 
 @dataclass
@@ -56,6 +58,7 @@ class ParsedFormat:
 
 class FormatError(ValueError):
     """Raised when a format string cannot be parsed or validated."""
+
 
 
 @dataclass
@@ -290,6 +293,7 @@ async def handle_file_or_link(update: Update, context: ContextTypes.DEFAULT_TYPE
             result = await _handle_url(
                 update, context, source_format, target_format, lines_per_file
             )
+
         else:
             await update.message.reply_text(
                 "Отправьте файл в формате .txt или прямую ссылку на загрузку."
@@ -300,6 +304,7 @@ async def handle_file_or_link(update: Update, context: ContextTypes.DEFAULT_TYPE
         await update.message.reply_text(f"Произошла ошибка: {exc}")
         return ConversationHandler.END
 
+
     produced_files = await _finalize_processing(update, context, result)
 
     if produced_files:
@@ -308,6 +313,7 @@ async def handle_file_or_link(update: Update, context: ContextTypes.DEFAULT_TYPE
         )
     else:
         await update.message.reply_text("Для новой обработки отправьте /start.")
+
 
     context.user_data.clear()
     return ConversationHandler.END
@@ -320,6 +326,7 @@ async def _handle_document(
     target_format: str,
     lines_per_file: int,
 ) -> ProcessResult:
+
     document = update.message.document
     if document.file_size and document.file_size > TELEGRAM_FILE_LIMIT:
         raise ValueError("Входной файл превышает ограничение Telegram (≈49 МБ).")
@@ -335,6 +342,7 @@ async def _handle_document(
         )
 
 
+
 async def _handle_url(
     update: Update,
     context: ContextTypes.DEFAULT_TYPE,
@@ -342,6 +350,7 @@ async def _handle_url(
     target_format: str,
     lines_per_file: int,
 ) -> ProcessResult:
+  
     url = update.message.text.strip()
     await update.message.reply_chat_action(ChatAction.TYPING)
     response = requests.get(url, timeout=30)
@@ -350,9 +359,12 @@ async def _handle_url(
         tmp_file.write(response.content)
         tmp_path = Path(tmp_file.name)
     try:
+
         return _process_local_file(tmp_path, source_format, target_format, lines_per_file)
+
     finally:
         tmp_path.unlink(missing_ok=True)
+
 
 
 def _process_local_file(
@@ -473,6 +485,7 @@ async def _finalize_processing(
         )
 
     return result.produced_files
+
 
 
 async def _deliver_results(
